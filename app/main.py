@@ -1,14 +1,45 @@
+import asyncio
+from contextlib import asynccontextmanager
+import logging
 import os
 import secrets
 from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
+from app.alerts import AlertConfig, AlertEngine
+
+log = logging.getLogger(__name__)
+alert_engine: AlertEngine | None = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global alert_engine
+    stop = asyncio.Event()
+    worker = None
+    try:
+        config = AlertConfig.from_environment()
+        if config:
+            alert_engine = AlertEngine(config)
+            worker = asyncio.create_task(alert_engine.run(stop))
+    except Exception:
+        # Alert configuration must not take down the existing ingestion API.
+        log.exception("Push alerts disabled: check configuration and writable database path")
+    try:
+        yield
+    finally:
+        stop.set()
+        if worker:
+            await worker
+        alert_engine = None
+
 
 
 app = FastAPI(
     title="Weather Ultra Cloud",
     version="0.1.0",
+    lifespan=lifespan,
 )
 
 
@@ -86,6 +117,11 @@ async def receive_reading(
         )
 
     latest_reading = reading.model_dump()
+    if alert_engine:
+        try:
+            await asyncio.to_thread(alert_engine.observe, latest_reading)
+        except Exception:
+            log.exception("Could not queue alert; reading remains accepted")
 
     print(
         "CLOUD READING:",
